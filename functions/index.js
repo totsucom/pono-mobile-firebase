@@ -11,6 +11,12 @@ const fs = require('fs');
 const { createCanvas, loadImage } = require('canvas');
 const ExifImage = require('exif').ExifImage;
 
+// トリミング画像の高さ
+const TRIMMED_HEIGHT = 1200;
+
+// トリミング画像に付けるプレフィックス名
+const TRIMMED_PREFIX = 'trimmed_';
+
 
 // サムネイルのサイズ
 const THUMB_SIZE = 200;
@@ -19,11 +25,28 @@ const THUMB_SIZE = 200;
 const THUMB_PREFIX = 'thumb_';
 
 
+/*
+ * 汎用関数
+ */
+
 // 署名付きURLを取得する
-async function getUrlFromFile(bucketFile) {
+async function getUrlFromBucket(bucketFile) {
   const result = await bucketFile.getSignedUrl(
     {action: 'read', expires: '03-01-2500'});
   return result[0];
+}
+
+//キャンバスをローカルパスに保存
+function saveCanvas(canvas, contentType, localPath) {
+  var b64data = canvas.toDataURL(contentType).split(',')[1];
+  var buffer = new Buffer(b64data, 'base64');
+  fs.writeFileSync(localPath, buffer);
+}
+
+//ファイル名の拡張子を入れ替える extの例 .jpg
+function replaceExt(fileName, ext) {
+  return fileName.substr(0, fileName.length - path.extname(fileName).length)
+  + ext;
 }
 
 
@@ -37,23 +60,24 @@ exports.handleImagesForBasePictures = functions.firestore
 
   if (change.after.exists) {
     if (!change.before.exists) {
-      //ベース写真が追加された
+      //コレクションが追加された
       console.log('ベース写真が追加された');
-      const message = await generateBasePictureImage(change.after.data(), change.after.id);
+      const message = await generateBasePictureImages(change.after.data(), change.after.id);
       return console.log('handleImagesForBasePictures: ' + message);
     } else {
-      //ベース写真が更新された
+      //コレクションが更新された
       //写真ありきのコレクションなので、写真が変更されることはない
       return console.log('handleImagesForBasePictures: DB更新は処理しない');
     }
   } else {
-    //ベース写真が削除された
+    //コレクションが削除された
     console.log('ベース写真が削除された');
-    const message = await deleteProblemImages(change.before.data(), change.before.id);
+    const message = await deleteBasePictureImages(change.before.data(), change.before.id);
     return console.log('handleImagesForBasePictures: ' + message);
   }
 });
 
+//ストレージからURLを取得する
 //無いときは undefined
 function getOrientation(file) {
   console.log(file);
@@ -73,17 +97,14 @@ function getOrientation(file) {
   });
 }
 
-async function generateBasePictureImage(snap, docID) {
+async function generateBasePictureImages(snap, docID) {
 
-  const contentType = 'image/png';
-  const extension = '.png';
-
-  const COLLECTION_NAME = 'basePictures';
-  //const IMAGE_URL_FIELD_NAME = 'pictureURL';          //write
-  const THUMB_IMAGE_URL_FIELD_NAME = 'thumbnailURL';  //write
+  /*
+   * 元画像の準備
+   */
 
   //元画像のStorage情報
-  const originalStoragePath = snap.picturePath;     //DBから取得
+  const originalStoragePath = snap.originalPath;     //DBから取得
   const originalName = path.basename(originalStoragePath);
   const storageDir = path.dirname(originalStoragePath);
 
@@ -91,66 +112,173 @@ async function generateBasePictureImage(snap, docID) {
   const originalLocalPath = path.join(os.tmpdir(), originalName);
   const localDir = path.dirname(originalLocalPath);
 
-  //サムネイルのStorage情報
-  const thumbName = THUMB_PREFIX + originalName
-    .substr(0, originalName.length - path.extname(originalName).length)
-    + extension;
-  const thumbStoragePath = path.join(storageDir, thumbName);
-
-  //サムネイル像のLocal情報
-  const thumbLocalPath = path.join(os.tmpdir(), thumbName);
-
-  console.log('ストレージパス ' + originalStoragePath + ' ' + thumbStoragePath);
-  console.log('ローカルパス ' + originalLocalPath + ' ' + thumbLocalPath);
-
   //Storageオブジェクトを作成
   const bucket = admin.storage().bucket();
   const originalFile = bucket.file(originalStoragePath);
-  const thumbFile = bucket.file(thumbStoragePath);
 
   //元画像をダウンロードする
-  //const originalURL = await getUrlFromFile(originalFile);
-  //const originalImage = await loadImage(originalURL);
   await mkdirp(localDir);
   await originalFile.download({destination: originalLocalPath});
-  const originalImage = await loadImage(originalLocalPath);
- 
-  //Exif情報からOrientationを取得
-  const orientation = await getOrientation(originalLocalPath);
-  var angle = 0.0;
-  if (orientation == 3) angle = 180.0;
-  else if (orientation == 6) angle = 90.0;
-  else if (orientation == 8) angle = 270.0;
+  var originalImage = await loadImage(originalLocalPath);
 
-  const canvas = createCanvas(THUMB_SIZE, THUMB_SIZE);
-  const ctx = canvas.getContext('2d');
+
+  /*
+   * 元画像の方向修正とトリミング
+   */
+
+   //Exif情報からOrientationを取得
+  const orientation = await getOrientation(originalLocalPath);
+  var angle = 0;
+  if (orientation == 3) angle = 180;
+  else if (orientation == 6) angle = 90;
+  else if (orientation == 8) angle = 270;
+  else {
+    console.log('This exif orientation is not supported');
+  }
+  console.log('Exif orientation = ' + orientation + ' angle = ' + angle);
+
+  angle = (angle + snap.rotation) % 360;
+  console.log('Final angle = ' + angle);
+
+  var trimLeft,trimRight,trimTop,trimBottom;
+  if (angle == 0 || angle == 180) {
+    trimLeft = snap.trimLeft * originalImage.width;
+    trimRight = snap.trimRight * originalImage.width;
+    trimTop = snap.trimTop * originalImage.height;
+    trimBottom = snap.trimBottom * originalImage.height;
+  } else {
+    trimLeft = snap.trimLeft * originalImage.height;
+    trimRight = snap.trimRight * originalImage.height;
+    trimTop = snap.trimTop * originalImage.width;
+    trimBottom = snap.trimBottom * originalImage.width;
+  }
+
+  var canvas, ctx;
+  if (angle == 90) {
+    var sw = originalImage.width - trimTop - trimBottom;
+    var sh = originalImage.height - trimLeft - trimRight;
+    var dw = sh / sw * TRIMMED_HEIGHT;
+    var dh = TRIMMED_HEIGHT;
+    canvas = createCanvas(dw, dh);
+    ctx = canvas.getContext('2d');
+    ctx.translate(0, dh);
+    ctx.rotate(angle / 180.0 * Math.PI);
+    ctx.drawImage(originalImage,
+      trimTop, trimRight, sw, sh,
+      -dh, -dw, dh, dw);
+  } else if (angle == 180) {
+    var sw = originalImage.width - trimLeft - trimRight;
+    var sh = originalImage.height - trimTop - trimBottom;
+    var dw = sw / sh * TRIMMED_HEIGHT;
+    var dh = TRIMMED_HEIGHT;
+    canvas = createCanvas(dw, dh);
+    ctx = canvas.getContext('2d');
+    ctx.translate(0, 0);
+    ctx.rotate(angle / 180.0 * Math.PI);
+    ctx.drawImage(originalImage,
+      trimRight, trimBottom, sw, sh,
+      -dw, -dh, dw, dh);
+  } else if (angle == 270) {
+    var sw = originalImage.width - trimTop - trimBottom;
+    var sh = originalImage.height - trimLeft - trimRight;
+    var dw = sh / sw * TRIMMED_HEIGHT;
+    var dh = TRIMMED_HEIGHT;
+    canvas = createCanvas(dw, dh);
+    ctx = canvas.getContext('2d');
+    ctx.translate(0, dh);
+    ctx.rotate(angle / 180.0 * Math.PI);
+    ctx.drawImage(originalImage,
+      trimBottom, trimLeft, sw, sh,
+      0, 0, dh, dw);
+  } else /* if (angle == 0) */ {
+    var sw = originalImage.width - trimLeft - trimRight;
+    var sh = originalImage.height - trimTop - trimBottom;
+    var dw = sw / sh * TRIMMED_HEIGHT;
+    var dh = TRIMMED_HEIGHT;
+    canvas = createCanvas(dw, dh);
+    ctx = canvas.getContext('2d');
+    ctx.drawImage(originalImage,
+      trimLeft, trimTop, sw, sh,
+      0, 0, dw, dh);
+  }
+  originalImage = undefined;  //もう使用しない（デカイ）
+
+
+  /*
+   * トリム画像の準備と保存
+   */
+
+  //トリム画像のStorage情報
+  const trimmedName = TRIMMED_PREFIX + originalName;
+  const trimmedStoragePath = path.join(storageDir, trimmedName);
+
+  //Storageオブジェクトを作成
+  const trimmedFile = bucket.file(trimmedStoragePath);
+  
+  //トリム画像のLocal情報
+  const trimmedLocalPath = path.join(os.tmpdir(), trimmedName);
+
+  //ローカルファイルに保存
+  saveCanvas(canvas, originalFile.contentType, trimmedLocalPath);
+
+  //ストレージにアップロードする
+  await bucket.upload(trimmedLocalPath,
+    {destination:trimmedFile, metadata: {contentType: originalFile.contentType}});
+
+  //サムネイル作成のためにトリムした画像を読み直す
+  //※キャンバスから直接変換できなかったw
+  const trimmedImage = await loadImage(trimmedLocalPath);
+
+  //一時ファイルを削除する
+  fs.unlinkSync(trimmedLocalPath);
+
+  //URLを取得する
+  const trimmedURL = await getUrlFromBucket(trimmedFile);
+  console.log('トリム画像 ' + trimmedURL);
+
+
+  /*
+   * サムネイル画像の生成
+   */
+
+  canvas = createCanvas(THUMB_SIZE, THUMB_SIZE);
+  ctx = canvas.getContext('2d');
 
   ctx.beginPath();
   ctx.fillStyle = "rgba(255, 255, 255, 0.0)";
   ctx.fillRect(0, 0, THUMB_SIZE, THUMB_SIZE);
   ctx.stroke();
 
-  ctx.translate(THUMB_SIZE/2, THUMB_SIZE/2);
-  ctx.rotate(angle / 180.0 * Math.PI);
+  var scale_x = THUMB_SIZE / trimmedImage.width;
+  var scale_y = THUMB_SIZE / trimmedImage.height;
+  var scale = (scale_x < scale_y) ? scale_x : scale_y;
 
-  var scale_x = THUMB_SIZE / originalImage.width;
-  var scale_y = THUMB_SIZE / originalImage.height;
-  var scale = (scale_y < scale_x) ? scale_y : scale_x;
-
-  var dw = originalImage.width * scale;
-  var dh = originalImage.height * scale;
-  var dx = -dw / 2;
-  var dy = -dh / 2;
-
-  ctx.drawImage(originalImage, 0, 0, originalImage.width, originalImage.height,
-    dx, dy, dw, dh);
+  var dw = trimmedImage.width * scale;
+  var dh = trimmedImage.height * scale;
+  ctx.drawImage(trimmedImage,
+    0, 0, trimmedImage.width, trimmedImage.height,
+    (THUMB_SIZE - dw) / 2, (THUMB_SIZE - dh) / 2, dw, dh);
 
 
-  //一時フォルダを作成し、キャンバスの内容をローカルファイルに保存
-  //await mkdirp(localDir);
-  var b64data = canvas.toDataURL(contentType).split(',')[1];
-  var buffer = new Buffer(b64data, 'base64');
-  fs.writeFileSync(thumbLocalPath, buffer);
+  /*
+   * サムネイル画像の準備と保存
+   */
+
+  const contentType = 'image/png';
+  const extension = '.png';
+
+  //サムネイルのStorage情報
+  const thumbName = THUMB_PREFIX + replaceExt(originalName, extension);
+  const thumbStoragePath = path.join(storageDir, thumbName);
+
+  //Storageオブジェクトを作成
+  const thumbFile = bucket.file(thumbStoragePath);
+
+  //サムネイルのLocal情報
+  const thumbLocalPath = path.join(os.tmpdir(), thumbName);
+
+  //ローカルファイルに保存
+  saveCanvas(canvas, contentType, thumbLocalPath);
 
   //ストレージにアップロードする
   await bucket.upload(thumbLocalPath,
@@ -161,35 +289,61 @@ async function generateBasePictureImage(snap, docID) {
 
   //URLを取得する
   const thumbURL = await getUrlFromBucket(thumbFile);
+  console.log('サムネイル ' + thumbURL);
+
+
+  /*
+   * ＤＢ保存と後片付け
+   */
 
   //DBに保存
   var data = {};
-  //data[IMAGE_URL_FIELD_NAME] = originalURL;
-  data[THUMB_IMAGE_URL_FIELD_NAME] = thumbURL;
-  await admin.firestore().collection(COLLECTION_NAME).doc(docID).update(data);
+  data['originalPath'] = '';  //画像を加工したのでこの項目は不要
+  data['rotation'] = 0;
+  data['trimLeft'] = 0.0;
+  data['trimTop'] = 0.0;
+  data['trimRight'] = 0.0;
+  data['trimBottom'] = 0.0;
+
+  data['picturePath'] = trimmedStoragePath;
+  data['pictureURL'] = trimmedURL;
+  data['thumbnailURL'] = thumbURL;
+  await admin.firestore().collection('basePictures').doc(docID).update(data);
+
+  //元画像を削除する
+  fs.unlinkSync(originalLocalPath);
+  originalFile.delete();
 
   return thumbURL;
 }
 
-async function deleteProblemImages(snap, docID) {
+async function deleteBasePictureImages(snap, docID) {
 
   //元画像のStorage情報
-  const originalStoragePath = snap.basePicturePath;     //DBから取得
-  const originalName = path.basename(originalStoragePath);
-  const storageDir = path.dirname(originalStoragePath);
+  const trimmedStoragePath = snap.picturePath;     //DBから取得
+  console.log('trimmedStoragePath = ' + trimmedStoragePath);
+  const trimmedName = path.basename(trimmedStoragePath);
+  const storageDir = path.dirname(trimmedStoragePath);
+
+  if (!trimmedName.startsWith(TRIMMED_PREFIX)) {
+    return 'ファイル名にトリムプレフィックスがついてません！';
+  }
+  const originalName = trimmedName.substring(TRIMMED_PREFIX.length);
 
   //サムネイルのStorage情報
-  const thumbStoragePath = path.normalize(
-    path.join(storageDir, `${THUMB_PREFIX}${originalName}`));
+  const thumbName = THUMB_PREFIX + replaceExt(originalName, ".png");
+  const thumbStoragePath = path.join(storageDir, thumbName);
+
+  console.log('thumbStoragePath = ' + thumbStoragePath);
 
   //Storageオブジェクトを作成
-  const bucket = admin.storage().bucket(object.bucket);
-  const originalFile = bucket.file(originalStoragePath);
+  const bucket = admin.storage().bucket();
+  const trimmedFile = bucket.file(trimmedStoragePath);
   const thumbFile = bucket.file(thumbStoragePath);
 
   var message = '';
   try {
-    await originalFile.delete();
+    await trimmedFile.delete();
     message += '元画像を削除しました '
   } catch (e) { }
   try {
@@ -205,6 +359,7 @@ async function deleteProblemImages(snap, docID) {
  * problemコレクションに変更があった場合に呼び出される
  * 
  */
+/*
 exports.handleImagesForProblem = functions.firestore
   .document('problems/{documentID}').onWrite(async (change, context) => {
 
@@ -229,20 +384,15 @@ exports.handleImagesForProblem = functions.firestore
 
   return console.log('handleImagesForProblem 完了');
 });
-
-//キャンバスの内容をファイルに書き出す
+*/
+/*//キャンバスの内容をファイルに書き出す
 async function saveCanvas(canvas, filePath) {
   var b64data = canvas.toDataURL("image/jpeg", 0.75).split(',')[1];
   var buffer = new Buffer(b64data, 'base64');
   fs.writeFileSync(filePath, buffer);
-}
+}*/
+/*
 
-// 署名付きURLを取得する
-async function getUrlFromBucket(bucketFile) {
-  const result = await bucketFile.getSignedUrl(
-    {action: 'read', expires: '03-01-2500'});
-  return result[0];
-}
 
 async function updateProblemImages(snap, docID) {
   const { createCanvas, loadImage } = require('canvas');
@@ -286,7 +436,7 @@ async function updateProblemImages(snap, docID) {
   await mkdirp(tempLocalDir);
 
   // キャンバスを一時ファイルに保存
-  await saveCanvas(canvas, tempLocalFile);
+  await saveCanvas(canvas, 'image/jpeg', tempLocalFile);
 
   // Storage用のオブジェクトを準備
   const completedImagePath = `${IMGE_OUTPUT_PATH}/${docID}.jpg`;
@@ -308,11 +458,6 @@ async function updateProblemImages(snap, docID) {
   console.log("completedImageURL = " + completedImageURL);
 
   // Firestore のコレクションを更新
-  /*await snap.ref.set({
-    //decodeURI()を使ってもFirestoreに格納されるURLは%でエスケープされてしまうので注意
-    completedImageURL: completedImageURL,
-    generateImageRequired: false
-  });*/
   await admin.firestore().collection(COLLECTION_NAME).doc(docID).set({
     //decodeURI()を使ってもFirestoreに格納されるURLは%でエスケープされてしまうので注意
     completedImageURL: completedImageURL,
@@ -334,3 +479,4 @@ async function deleteProblemImages(snap, docID) {
   } catch (e) {
   }
 }
+*/
