@@ -1,36 +1,329 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // This rule allows anyone with your database reference to view, edit,
-    // and delete all data in your Firestore database. It is useful for getting
-    // started, but it is configured to expire after 30 days because it
-    // leaves your app open to attackers. At that time, all client
-    // requests to your Firestore database will be denied.
-    //
-    // Make sure to write security rules for your app before that time, or else
-    // all client requests to your Firestore database will be denied until you Update
-    // your rules
-    match /{document=**} {
-      allow read, write: if request.time < timestamp.date(2020, 9, 13);
+
+    // リクエスターはFirebaseの認証ユーザーか？
+    function isAnyAuthenticated() { return request.auth != null; }
+
+    // リクエスターは管理者か？
+    function isAdministrator() {
+      return request.auth != null && request.auth.token.admin == true;
     }
-  }
 
-	match /databases/{database}/documents {
-  	function serverTimestamp() { return firebase.firestore.FieldValue.serverTimestamp(); }
-    function isAuthenticated() { return request.auth != null; }
-    function isUserAuthenticated(userID) { return isAuthenticated() && request.auth.uid == userID; }
+    // リクエスターのIDがuserIDかどうか？
+    function isUserAuthenticated(userID) { return request.auth.uid == userID; }
+
+    // 既に持っているデータ
     function existingData() { return resource.data; }
-    function incomingData() { return request.resource.data; }
-    function validateString(text, min, max) { return text is string && text.size() >= min && text.size() <= max; }
 
-    //match /users/{userID} {
-    //  allow get: if isAuthenticated()
-    //  allow create: if request.time == serverTimestamp()
-    //  	&& isUserAuthenticated(userID)
-    //    && validateString(incomingData.displayName, 1, 20);
-    //  allow update: if request.time == serverTimestamp()
-    //  	&& isUserAuthenticated(userID)
-    //  	&& (!('displayName' in incomingData()) || validateString(incomingData.displayName, 1, 20));
+    // リクエストしてきているデータ
+    function incomingData() { return request.resource.data; }
+
+    // フィールドが更新していないかどうか？（更新してほしくないものをチェック）
+    //function isNotUpdating(fieldName) {
+    //  return !(fieldName in request.resource.data)
+    //    || request.resource.data[fieldName] == resource.data[fieldName];
     //}
+
+    // リクエストの中に必要なフィールドをすべて含んでいるか？
+    //function isWritingNecessaryFields(necessaryFields) {
+    //  return incomingData().keys().hasAll(necessaryFields);
+    //  //return necessaryFields.hasAll(request.resource.data.keys());
+    //}
+
+    // リクエストは許可されたフィールドのみを含んでいるか？
+    //function isWritingAllowedFields(allowedFields) {
+    //  return allowedFields.hasAll(incomingData().keys());
+    //  //return request.resource.data.keys().hasAll(allowedFields);
+    //}
+
+    // リクエストの中に変更禁止フィールドを含んでいないか？
+    //function shouldNotInclude(fieldName) {
+    //  return !(fieldName in incomingData().keys());
+    //}
+
+
+    //《重要》
+    // request.resource.data.keys() 
+    // 新規作成時これは想像通りに機能するが、updateではクエリが実行されたあとの状態
+    // を返してしまう。例えば
+    // create { name:'Bob', tall:170 }
+    // update { tall: 169, weight 60 }
+    // のように更新する場合でupdateのルール確認が実行されるとき、以下のようになる。
+    //         resource.data { name:'Bob', tall:170, ---       }
+    // request.resource.data { name:'Bob', tall:169, weight 60 }
+
+
+    //デバッグ
+    function printRequestKeys() {
+      return debug(request.resource.data.keys()) || true;
+    }
+    function printRequestKeyValue(fieldName) {
+      return debug(request.resource.data[fieldName]) || true;
+    }
+    function printResourceKeyValue(fieldName) {
+      return debug(resource.data[fieldName]) || true;
+    }
+
+
+    // 固定されたフィールドのみを許可
+    function hasFixedFields(necessaryFields) {
+      return request.resource.data.keys().hasOnly(necessaryFields);
+      //return request.resource.data.keys().hasAll(necessaryFields)
+      //  && necessaryFields.hasAll(request.resource.data.keys());
+    }
+
+    // 値が更新されているか？
+    function isModified(fieldName) {
+      return request.resource.data[fieldName] != resource.data[fieldName];
+    }
+
+    // パスを作成
+    function documentPath(paths) {
+      return path([['databases', database, 'documents'].join('/'),
+        paths.join('/')].join('/'));
+    }
+
+    // 文字列のバリデーション
+    function isValidString(text, min, max) {
+      return text is string && text.size() >= min && text.size() <= max;
+    }
+
+    // 数値のバリデーション
+    function isValidNumber(num, min, max) {
+      return num is number && min <= num && num <= max;
+    }
+
+    // 整数値のバリデーション
+    function isValidInt(num, min, max) {
+      return num is int && min <= num && num <= max;
+    }
+
+    // 論理型のバリデーション
+    //function isBoolean(value) {
+    //  return value is bool;
+    //}
+
+
+    match /users/{documentID} {
+
+      allow read: if isAnyAuthenticated();
+
+      allow create: if isAnyAuthenticated()
+        && isUserAuthenticated(documentID) //documentID = uid 制限
+        && hasFixedFields(['displayName', 'iconURL', 'createdAt', 'updatedAt'])
+        && isValidString(incomingData().displayName, 1, 20)
+        && isValidString(incomingData().iconURL, 0, 2000)
+        && incomingData().createdAt is timestamp
+        && incomingData().createdAt == request.time
+        && incomingData().updatedAt is timestamp
+        && incomingData().updatedAt == request.time;
+
+      allow update: if isAnyAuthenticated()
+        && isUserAuthenticated(documentID) //documentID = uid 制限
+        && hasFixedFields(['displayName', 'iconURL', 'createdAt', 'updatedAt'])
+        && isValidString(incomingData().displayName, 1, 20)
+        && isValidString(incomingData().iconURL, 0, 2000)
+        && incomingData().createdAt is timestamp
+        && !isModified('createdAt')
+        && incomingData().updatedAt is timestamp
+        && incomingData().updatedAt == request.time;
+        
+      allow delete: if isAnyAuthenticated()
+        && isAdministrator();
+    }
+
+    match /basePictures/{documentID} {
+
+      allow read: if isAnyAuthenticated();
+
+      allow create: if isAnyAuthenticated()
+        && isAdministrator()
+        && hasFixedFields(['name', 'picturePath', 'pictureURL', 'thumbnailURL',
+          'wallIDs', 'wallText', 'uid', 'originalPath', 'rotation', 'trimLeft', 'trimTop',
+          'trimRight', 'trimBottom', 'createdAt'])
+        && isValidString(incomingData().name, 1, 20)
+        && isValidString(incomingData().picturePath, 0, 1000) //後から設定
+        && isValidString(incomingData().pictureURL, 0, 1000) //後から設定
+        && isValidString(incomingData().thumbnailURL, 0, 1000) //後から設定
+        && isValidString(incomingData().uid, 1, 1000)
+        && incomingData().wallIDs is list
+        && isValidString(incomingData().wallText, 0, 100)
+        && incomingData().uid == request.auth.uid
+        && isValidString(incomingData().originalPath, 0, 1000)
+        && isValidInt(incomingData().rotation, 0, 270)
+        && isValidNumber(incomingData().trimLeft, 0.0, 1.0)
+        && isValidNumber(incomingData().trimTop, 0.0, 1.0)
+        && isValidNumber(incomingData().trimRight, 0.0, 1.0)
+        && isValidNumber(incomingData().trimBottom, 0.0, 1.0)
+        && incomingData().createdAt is timestamp
+        && incomingData().createdAt == request.time;
+
+      allow update: if isAnyAuthenticated()
+        && isAdministrator()
+        && hasFixedFields(['name', 'picturePath', 'pictureURL', 'thumbnailURL',
+          'wallIDs', 'wallText', 'uid', 'originalPath', 'rotation', 'trimLeft', 'trimTop',
+          'trimRight', 'trimBottom', 'createdAt'])
+        && isValidString(incomingData().name, 1, 20)
+        && isValidString(incomingData().picturePath, 0, 1000) //後から設定
+        && isValidString(incomingData().pictureURL, 0, 1000) //後から設定
+        && isValidString(incomingData().thumbnailURL, 0, 1000) //後から設定
+        && isValidString(incomingData().uid, 1, 1000)
+        && incomingData().wallIDs is list
+        && isValidString(incomingData().wallText, 0, 100)
+        && !isModified('uid')
+        && isValidString(incomingData().originalPath, 0, 1000)
+        && isValidInt(incomingData().rotation, 0, 270)
+        && isValidNumber(incomingData().trimLeft, 0.0, 1.0)
+        && isValidNumber(incomingData().trimTop, 0.0, 1.0)
+        && isValidNumber(incomingData().trimRight, 0.0, 1.0)
+        && isValidNumber(incomingData().trimBottom, 0.0, 1.0)
+        && !isModified('createdAt');
+
+      allow delete: if isAnyAuthenticated()
+        && isAdministrator();
+    }
+
+    match /problems/{documentID} {
+      allow read: if isAnyAuthenticated();
+
+      allow create: if isAnyAuthenticated()
+        && hasFixedFields(['basePicturePath', 'basePictureURL', 
+          'trimLeft', 'trimTop', 'trimRight', 'trimBottom',
+          'imageRequired', 'completedImageURL',
+          'completedImageThumbURL', 'title', 'grade', 'wallIDs',
+          'wallText', 'footFree',
+          'comment', 'status', 'uid', 'createdAt', 'updatedAt', 'publishedAt'])
+        && isValidString(incomingData().basePicturePath, 1, 1000)
+        && isValidString(incomingData().basePictureURL, 1, 1000)
+        && isValidNumber(incomingData().trimLeft, 0.0, 1.0)
+        && isValidNumber(incomingData().trimTop, 0.0, 1.0)
+        && isValidNumber(incomingData().trimRight, 0.0, 1.0)
+        && isValidNumber(incomingData().trimBottom, 0.0, 1.0)
+        && incomingData().imageRequired is bool
+        && isValidString(incomingData().completedImageURL, 0, 1000)
+        && isValidString(incomingData().completedImageThumbURL, 0, 1000)
+        && isValidString(incomingData().title, 0, 20)
+        && isValidString(incomingData().grade, 0, 20)
+        //&& incomingData().grade != 0
+        //&& isValidString(incomingData().gradeOption, 0, 20)
+        && incomingData().wallIDs is list
+        && isValidString(incomingData().wallText, 0, 100)
+        && incomingData().footFree is bool
+        && isValidString(incomingData().comment, 0, 100)
+        && incomingData().status is string
+        && (incomingData().status in ['ProblemStatus.Draft','ProblemStatus.Private','ProblemStatus.Public'])
+        && isUserAuthenticated(incomingData().uid)
+        && incomingData().createdAt is timestamp
+        && incomingData().createdAt == request.time
+        && incomingData().updatedAt is timestamp
+        && incomingData().updatedAt == request.time
+        && (incomingData().publishedAt == null
+          || (incomingData().publishedAt is timestamp
+            && incomingData().publishedAt == request.time));
+
+      allow update: if isAnyAuthenticated()
+        && (isAdministrator()                         // Cloud Functions
+          || isUserAuthenticated(existingData().uid)) // ユーザー自身の編集
+        && hasFixedFields(['basePicturePath', 'basePictureURL',
+          'trimLeft', 'trimTop', 'trimRight', 'trimBottom',
+          'imageRequired', 'completedImageURL',
+          'completedImageThumbURL', 'title', 'grade', 'wallIDs',
+          'wallText', 'footFree',
+          'comment', 'status', 'uid', 'createdAt', 'updatedAt', 'publishedAt'])
+        && isValidString(incomingData().basePicturePath, 1, 1000)
+        && isValidString(incomingData().basePictureURL, 1, 1000)
+        && isValidNumber(incomingData().trimLeft, 0.0, 1.0)
+        && isValidNumber(incomingData().trimTop, 0.0, 1.0)
+        && isValidNumber(incomingData().trimRight, 0.0, 1.0)
+        && isValidNumber(incomingData().trimBottom, 0.0, 1.0)
+        && incomingData().imageRequired is bool
+        && isValidString(incomingData().completedImageURL, 0, 1000)
+        && isValidString(incomingData().completedImageThumbURL, 0, 1000)
+        && isValidString(incomingData().title, 0, 20)
+        && isValidString(incomingData().grade, 0, 20)
+        //&& incomingData().grade != 0
+        //&& isValidString(incomingData().gradeOption, 0, 20)
+        && incomingData().wallIDs is list
+        && isValidString(incomingData().wallText, 0, 100)
+        && incomingData().footFree is bool
+        && isValidString(incomingData().comment, 0, 100)
+        && incomingData().status is string
+        && (incomingData().status in ['ProblemStatus.Draft','ProblemStatus.Private','ProblemStatus.Public'])
+        && !isModified('uid')
+        && !isModified('createdAt')
+        && incomingData().updatedAt is timestamp
+        && (incomingData().publishedAt == null
+          || incomingData().publishedAt is timestamp);
+
+        //&& incomingData().updatedAt == request.time
+        //&& (incomingData().publishedAt == null
+        //  || (incomingData().publishedAt is timestamp
+        //    && incomingData().publishedAt == request.time));
+
+      allow delete: if isAnyAuthenticated()
+        && isUserAuthenticated(existingData().uid); // ユーザー自身による削除
+
+
+      function problemUid() {
+          return get(/databases/$(database)/documents/problems/$(documentID))
+            .data.uid;
+      }
+
+      match /primitives/{documentID} {
+        allow read: if isAnyAuthenticated();
+
+        //パラメーターチェックは緩い
+        
+        allow create: if isAnyAuthenticated()
+          && isUserAuthenticated(problemUid())
+          && hasFixedFields(['type', 'positionX', 'positionY', 'sizeType',
+            'color', 'subItemPosition'])
+          && isValidString(incomingData().type, 1, 100)
+          && incomingData().positionX is number
+          && incomingData().positionY is number
+          && isValidString(incomingData().sizeType, 1, 100)
+          && isValidString(incomingData().color, 5, 11)
+          && isValidString(incomingData().subItemPosition, 1, 100);
+
+        allow update: if isAnyAuthenticated()
+          && isUserAuthenticated(problemUid())
+          && hasFixedFields(['type', 'positionX', 'positionY', 'sizeType',
+            'color', 'subItemPosition'])
+          && isValidString(incomingData().type, 1, 100)
+          && incomingData().positionX is number
+          && incomingData().positionY is number
+          && isValidString(incomingData().sizeType, 1, 100)
+          && isValidString(incomingData().color, 5, 11)
+          && isValidString(incomingData().subItemPosition, 1, 100);
+
+        allow delete: if isAnyAuthenticated()
+          && isUserAuthenticated(problemUid()); // ユーザー自身による削除
+      }
+    }
+
+    match /walls/{documentID} {
+
+      allow read: if isAnyAuthenticated();
+
+      allow create: if isAnyAuthenticated()
+        && isAdministrator()
+        && hasFixedFields(['name', 'active', 'order'])
+        && isValidString(incomingData().name, 1, 10)
+        && incomingData().active is bool
+        && incomingData().order is int;
+
+      allow update: if isAnyAuthenticated()
+        && isAdministrator()
+        && hasFixedFields(['name', 'active', 'order'])
+        && !isModified('name')                //名前は変更できない
+        && incomingData().active is bool      //有効／無効のみ変更可
+        && incomingData().order is int;
+
+      allow delete: if isAnyAuthenticated()
+        && isAdministrator();
+    }
+
+
   }
 }

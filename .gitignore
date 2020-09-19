@@ -69,3 +69,5 @@ node_modules/
 
 /database/
 /firebase.*
+serviceAccountKey/
+site.js

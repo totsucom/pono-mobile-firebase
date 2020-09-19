@@ -8,10 +8,30 @@
     "firebase-functions": "^3.11.0",
     "node": "^10.22.0"
   },
-  "devDependencies": {},
+  "devDependencies": {
+    "@firebase/testing": "^0.20.11",
+    "@types/jest": "^26.0.13",
+    "filesystem": "^1.0.1",
+    "jest": "^24.0.0",
+    "source-map-support": "^0.5.19",
+    "ts-jest": "^26.3.0",
+    "ts-node": "^9.0.0",
+    "typescript": "^4.0.2"
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "jest"
   },
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "jest": {
+    "transform": {
+      "\\.ts": "<rootDir>/node_modules/ts-jest/preprocessor.js"
+    },
+    "testRegex": "test/.*test.ts",
+    "moduleFileExtensions": [
+      "ts",
+      "js",
+      "json"
+    ]
+  }
 }
